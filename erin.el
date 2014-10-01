@@ -50,6 +50,17 @@
 
 ;;; HISTORY:
 
+;; [Unofficial version, 2014-10-01] URL support added
+;; by Thomas Fitzsimmons <fitzsim@fitzsim.org>
+;;
+;; Customize the following variables:
+;;
+;; `erin-url-format': the format of a TWiki URL with no trailing slash
+;; and %s in place of the operation; e.g. "http://twiki.org/cgi-bin/%s/TWiki"
+;; `erin-username': the TWiki username
+;; `erin-local-directory': the directory in which temporary TWiki
+;; files will be stored; defaults to "~/.emacs.d/erin".
+;;
 ;; [Version 0.6, 2009-08-19] Removed the erroneous setting of
 ;; `fill-paragraph-function'.  Thanks to Michael Shields for reporting.
 ;;
@@ -81,11 +92,36 @@
 ;;; CODE:
 
 (require 'font-lock)
+;; URL requirement.
+(require 'mm-url)
 
 (defgroup erin nil
   "*erin.el editing mode for TWiki pages"
   :group 'hypermedia
   :group 'wp)
+
+;; URL defcustoms.
+(defcustom erin-local-directory (expand-file-name "~/.emacs.d/erin")
+  "Directory for temporary TWiki files.
+
+`erin-edit-topic' downloads raw TWiki text and saves it as a
+temporary file named <topic_name>.<unique_temp_string>.twiki in
+`erin-local-directory'."
+  :type 'string
+  :group 'erin)
+
+(defcustom erin-username ""
+  "TWiki username."
+  :type 'string
+  :group 'erin)
+
+(defcustom erin-url-format ""
+  "Format of the TWiki URLs.
+
+You can look this up from a web browser.  The %s will be replaced
+with the TWiki operation being performed."
+  :type 'string
+  :group 'erin)
 
 (defcustom erin-mode-hook nil
   "*Hooks run when `erin-mode' is turned on."
@@ -253,6 +289,10 @@
     ;; we can bind a flow-control character to something.
     (define-key x "\C-c\C-r" 'erin-renumber-headings)
     (define-key x "\C-c\C-s" 'erin-sampler)
+    ;; URL keybindings.
+    (define-key x "\C-c\C-c" 'erin-save-topic)
+    (define-key x "\C-c\C-k" 'erin-kill-buffer-and-delete-file)
+    (define-key x "\C-c\C-q" 'erin-cancel-edit)
     x))
 
 (defvar erin-font-lock-keywords
@@ -793,6 +833,174 @@
 ;;     '!!!
 ;; 
 ;;     (message "DEBUG: %S" parainfo)))
+
+;; URL support.
+(defun erin-got-login-page ()
+  "Check whether the login page was retrieved.
+
+Return t if the TWiki login page was retrieved by
+`url-retrieve-synchronously', nil otherwise."
+  (save-excursion
+    (goto-char (point-min))
+    (search-forward "<title>(TWiki login)" nil t)))
+
+(defun erin-format-url (operation endpoint)
+  "Format a TWiki URL.
+
+Return a URL by inserting OPERATION into `erin-url-format' and
+adding the ENDPOINT."
+  (when (equal erin-url-format "")
+    (error "Customize erin-url-format"))
+  (concat (format erin-url-format operation) "/" endpoint))
+
+(defun erin-log-in ()
+  "Log in to the TWiki.
+
+This function will prompt for a TWiki username and password.  It
+will auto-fill the username with `erin-username'.
+
+Upon successful log-in Emacs will store a TWiki session cookie in
+`url-cookie-storage'.  If this session cookie expires the user
+will need to call `erin-log-in' again."
+  (interactive)
+  (let ((url-request-method "POST")
+        (url-request-extra-headers `(("Content-Type"
+                                      . "application/x-www-form-urlencoded")))
+        (url-request-data (mm-url-encode-www-form-urlencoded
+                           (list (cons "username"
+                                       (read-from-minibuffer
+                                        "Username: " erin-username))
+                                 (cons "password"
+                                       (password-read "Password: "))))))
+    (with-current-buffer
+        (url-retrieve-synchronously (erin-format-url "login" "WebHome"))
+      (if (not (erin-got-login-page))
+          (message "erin: Login succeeded")
+        (message "erin: Login failed")))))
+
+(defun erin-log-out ()
+  "Log out of the TWiki."
+  (interactive)
+  (let ((url-request-method "POST")
+        (url-request-extra-headers `(("Content-Type"
+                                      . "application/x-www-form-urlencoded")))
+        (url-request-data (mm-url-encode-www-form-urlencoded
+                           (list (cons "logout" "1")))))
+    (with-current-buffer
+        (url-retrieve-synchronously (erin-format-url "login" "WebHome"))
+      (message "erin: Logout succeeded"))))
+
+(defun erin-edit-topic (topic)
+  "Edit a topic page from the TWiki.
+
+First, this function downloads the text of the page titled TOPIC
+from the TWiki, to a uniquely-named temporary file in
+`erin-local-directory'.  It then opens the file for editing in a
+new buffer."
+  (interactive "MTopic: ")
+  (let ((url-request-method "GET")
+        (url-request-extra-headers '())
+        (url-request-data "")
+        ;; . can't be used in topic names so use it as a separator.
+        ;; When the topic page contained in this file is saved, we
+        ;; strip off the leading directory and the trailing
+        ;; .<temp-string>.twiki and use the result as the topic page
+        ;; to post to.
+        (temporary-file-name))
+    (save-excursion
+      (with-current-buffer
+          (url-retrieve-synchronously (erin-format-url "edit" topic))
+        (if (erin-got-login-page)
+            (message "erin: Download failed. Log in again")
+          (progn
+            (message "erin: Download succeeded")
+            (goto-char (point-min))
+            (search-forward-regexp "<textarea.*?>")
+            (delete-region (point-min) (point))
+            (goto-char (point-max))
+            (search-backward-regexp "</textarea")
+            (delete-region (point) (point-max))
+            (mm-url-decode-entities)
+            (goto-char (point-min))
+            (if (not (file-name-absolute-p
+                      erin-local-directory))
+                (error (concat "The variable erin-local-directory"
+                               " must hold an absolute path")))
+            (make-directory erin-local-directory t)
+            (setq temporary-file-name (make-temp-file
+                                       (concat (file-name-as-directory
+                                                erin-local-directory)
+                                               topic ".") nil ".twiki"))
+            (write-region (point-min) (point-max) temporary-file-name))))
+      (when temporary-file-name
+        (find-file temporary-file-name)))))
+
+(defun erin-current-topic ()
+  "Return the topic name of the current buffer.
+
+The topic name is the base name of the file name returned by the
+function `buffer-file-name', excluding the first period and
+anything after it.  TWiki topic names must not contain periods so
+the period in the file name can be used as a delimiter."
+  (car (split-string (file-name-nondirectory (buffer-file-name))
+                     "\\.")))
+
+(defun erin-save-topic ()
+  "Save the edited contents of the current buffer's topic page to the TWiki.
+
+See `erin-current-topic' for how the topic name is determined."
+  (interactive)
+  (let ((url-request-method "POST")
+        (url-request-extra-headers
+         `(("Content-Type" . "application/x-www-form-urlencoded")))
+        (url-request-data (mm-url-encode-www-form-urlencoded
+                           (list (cons "text" (buffer-string)))))
+        (name (erin-current-topic)))
+    (if (y-or-n-p
+         (format "Post this buffer's contents as topic %s? " name))
+        (with-current-buffer
+            (url-retrieve-synchronously (erin-format-url "save" name))
+          (goto-char (point-min))
+          (if (search-forward
+               (concat "Location: " (erin-format-url "view" name)) nil t)
+              (message "erin: Save succeeded")
+            (message "erin: Save failed. Log in again")))
+      (message "erin: Save cancelled"))))
+
+(defun erin-cancel-edit ()
+  "Cancel editifng the current buffer's topic page in the TWiki.
+
+See `erin-current-topic' for how the topic name is determined."
+  (interactive)
+  (let ((url-request-method "POST")
+        (url-request-extra-headers `(("Content-Type"
+                                      . "application/x-www-form-urlencoded")))
+        (url-request-data (mm-url-encode-www-form-urlencoded
+                           (list (cons "action_cancel" "Cancel"))))
+        (name (erin-current-topic)))
+    (with-current-buffer
+        ;; No return checking here.  In other words, we assume this
+        ;; works since if it doesn't it's probably because the user is
+        ;; not logged in, in which case other users won't be blocked.
+        (url-retrieve-synchronously (erin-format-url "save" name))
+      (message
+       (format "erin: Edit cancelled. Others can now edit the %s topic"
+               name)))))
+
+(defun erin-kill-buffer-and-delete-file ()
+  "Finish editing.
+
+Kill the current buffer and delete the file associated with it."
+  (interactive)
+  (if (y-or-n-p (format "Delete file %s and kill buffer %s? "
+                        (buffer-file-name) (buffer-name)))
+      (progn
+        ;; Try to cancel the edit in case the user didn't save before
+        ;; this.
+        (erin-cancel-edit)
+        (delete-file (buffer-file-name))
+        (kill-buffer (buffer-name)))
+    (message "erin: Kill and delete cancelled")))
 
 ;; Auto-Modes:
 
