@@ -853,6 +853,7 @@ adding the ENDPOINT."
     (error "Customize erin-url-format"))
   (concat (format erin-url-format operation) "/" endpoint))
 
+;;;###autoload
 (defun erin-log-in ()
   "Log in to the TWiki.
 
